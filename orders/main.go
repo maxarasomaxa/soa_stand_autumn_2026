@@ -34,13 +34,30 @@ type PaymentReq struct {
 	Currency    string `json:"currency"`
 }
 
+// Событие, которое мы шлем в шину
+type OrderPaidEvent struct {
+	ID         string    `json:"id"`
+	Type       string    `json:"type"`
+	OrderID    string    `json:"order_id"`
+	OccurredAt time.Time `json:"occurred_at"`
+}
+
+// Событие, которое приходит от шины
+type DeliveryConfirmedEvent struct {
+	ID          string    `json:"id"`
+	Type        string    `json:"type"`
+	UserID      string    `json:"user_id"`
+	BonusPoints int64     `json:"bonus_points"`
+	OccurredAt  time.Time `json:"occurred_at"`
+}
+
 var (
 	db           *pgxpool.Pool
 	orderQueue   chan string
 	paymentURL   string
 	inventoryURL string
+	eventsURL    string // URL шины
 
-	// Состояние предохранителя (Gate) для Payment
 	gateMu              sync.Mutex
 	consecutiveFailures int
 	gateOpenUntil       time.Time
@@ -53,20 +70,26 @@ func main() {
 	dbURL := getEnv("DATABASE_URL", "postgres://orders:orders@postgres:5432/orders")
 	paymentURL = getEnv("PAYMENT_URL", "http://mocks:8080/payment")
 	inventoryURL = getEnv("INVENTORY_URL", "http://mocks:8080/inventory")
+	eventsURL = getEnv("EVENTS_URL", "http://mocks:8080") // База шины
 
 	initDB(dbURL)
 	orderQueue = make(chan string, 1000)
 
-	// Запускаем 5 фоновых воркеров
+	// 5 воркеров для заказов
 	for i := 0; i < 5; i++ {
 		go worker()
 	}
+	
+	// 1 воркер для отправки событий в шину
+	go outboxWorker()
 
 	recoverPendingOrders()
 
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/orders", createOrder)
 	http.HandleFunc("/orders/", getOrder)
+	http.HandleFunc("/webhooks/delivery", handleDeliveryWebhook) // Задание 2
+	http.HandleFunc("/users/", getUserBonus)                    // Задание 2
 
 	log.Printf("Starting server on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
@@ -93,6 +116,8 @@ func initDB(url string) {
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v", err)
 	}
+	
+	// Обновленная схема БД для обоих заданий
 	schema := `
 	CREATE TABLE IF NOT EXISTS orders (
 		id UUID PRIMARY KEY,
@@ -103,7 +128,28 @@ func initDB(url string) {
 		reservation_done BOOLEAN NOT NULL DEFAULT FALSE,
 		payment_state TEXT NOT NULL DEFAULT 'none',
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);`
+	);
+	
+	-- Таблица исходящих событий (Outbox)
+	CREATE TABLE IF NOT EXISTS outbox (
+		event_id UUID PRIMARY KEY,
+		event_type TEXT NOT NULL,
+		payload JSONB NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+
+	-- Таблица обработанных входящих событий (Idempotency)
+	CREATE TABLE IF NOT EXISTS processed_events (
+		event_id TEXT PRIMARY KEY,
+		processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+
+	-- Таблица бонусов
+	CREATE TABLE IF NOT EXISTS user_bonuses (
+		user_id TEXT PRIMARY KEY,
+		points BIGINT NOT NULL DEFAULT 0
+	);
+	`
 	_, err = db.Exec(context.Background(), schema)
 	if err != nil {
 		log.Fatalf("Failed to create schema: %v", err)
@@ -218,17 +264,53 @@ func processOrder(id string) {
 		db.Exec(ctx, "UPDATE orders SET reservation_done = true WHERE id = $1", id)
 	}
 
-	// 2. Оплата (с ожиданием Ворот внутри)
+	// 2. Оплата
 	payStatus, err := chargePayment(ctx, id, amount)
 	if err != nil {
 		db.Exec(ctx, "UPDATE orders SET payment_state = 'unknown' WHERE id = $1", id)
-		requeue(id, 2*time.Second) // Быстрый ретрай
+		requeue(id, 2*time.Second)
 		return
 	}
 
 	// 3. Установка финального статуса
 	if payStatus == "captured" {
-		db.Exec(ctx, "UPDATE orders SET status = 'paid', payment_state = 'charged' WHERE id = $1", id)
+		// ИСПОЛЬЗУЕМ ТРАНЗАКЦИЮ (Transactional Outbox)
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			requeue(id, 2*time.Second)
+			return
+		}
+		defer tx.Rollback(ctx) // Откатится, если не сделаем Commit
+
+		// Меняем статус
+		_, err = tx.Exec(ctx, "UPDATE orders SET status = 'paid', payment_state = 'charged' WHERE id = $1", id)
+		if err != nil {
+			requeue(id, 2*time.Second)
+			return
+		}
+
+		// Кладем событие в Outbox
+		eventID := newUUID()
+		event := OrderPaidEvent{
+			ID:         eventID,
+			Type:       "order.paid",
+			OrderID:    id,
+			OccurredAt: time.Now().UTC(),
+		}
+		payload, _ := json.Marshal(event)
+		
+		_, err = tx.Exec(ctx, "INSERT INTO outbox (event_id, event_type, payload) VALUES ($1, $2, $3)", eventID, "order.paid", payload)
+		if err != nil {
+			requeue(id, 2*time.Second)
+			return
+		}
+
+		// Фиксируем транзакцию (теперь и статус paid, и событие в базе)
+		if err := tx.Commit(ctx); err != nil {
+			requeue(id, 2*time.Second)
+			return
+		}
+
 	} else if payStatus == "declined" {
 		releaseInventory(ctx, id)
 		db.Exec(ctx, "UPDATE orders SET status = 'rejected', payment_state = 'declined' WHERE id = $1", id)
@@ -258,9 +340,134 @@ func recoverPendingOrders() {
 	}
 }
 
-// --- Логика предохранителя (Gate) ---
+// --- Логика исходящих событий (Outbox Worker) ---
 
-// Блокирует воркер, если Payment сейчас "лежит" (S4)
+func outboxWorker() {
+	for {
+		// Раз в секунду проверяем таблицу outbox
+		time.Sleep(1 * time.Second)
+
+		rows, err := db.Query(context.Background(), "SELECT event_id, payload FROM outbox ORDER BY created_at LIMIT 10")
+		if err != nil {
+			continue
+		}
+
+		for rows.Next() {
+			var eventID string
+			var payload []byte
+			if err := rows.Scan(&eventID, &payload); err != nil {
+				continue
+			}
+
+			// Пытаемся отправить в шину
+			if sendEventToBus(payload) {
+				// Если успешно — удаляем из outbox
+				db.Exec(context.Background(), "DELETE FROM outbox WHERE event_id = $1", eventID)
+			}
+		}
+		rows.Close()
+	}
+}
+
+func sendEventToBus(payload []byte) bool {
+	req, _ := http.NewRequest(http.MethodPost, eventsURL+"/events", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false // Шина недоступна, попробуем позже
+	}
+	defer resp.Body.Close()
+
+	// 202 Accepted — шина приняла событие
+	if resp.StatusCode == 202 {
+		return true
+	}
+	return false
+}
+
+// --- Логика входящих событий (Webhook) ---
+
+func handleDeliveryWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	var event DeliveryConfirmedEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+
+	ctx := context.Background()
+	
+	// Транзакция для безопасной идемпотентности
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		http.Error(w, "internal error", 500)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	// Пытаемся вставить ID события в таблицу обработанных
+	tag, err := tx.Exec(ctx, "INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT (event_id) DO NOTHING", event.ID)
+	if err != nil {
+		http.Error(w, "db error", 500)
+		return
+	}
+
+	// Если тег говорит, что вставлено 0 строк — значит, мы уже обрабатывали это событие
+	if tag.RowsAffected() == 0 {
+		w.WriteHeader(http.StatusOK) // Отвечаем 200, чтобы шина отстала
+		return
+	}
+
+	// Если мы здесь, значит событие новое. Начисляем бонусы!
+	_, err = tx.Exec(ctx, 
+		"INSERT INTO user_bonuses (user_id, points) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET points = user_bonuses.points + EXCLUDED.points",
+		event.UserID, event.BonusPoints)
+	if err != nil {
+		http.Error(w, "db error", 500)
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "db error", 500)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func getUserBonus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	// URL: /users/{id}/bonus. Нам нужно вырезать {id}
+	path := r.URL.Path
+	// Проверка, что путь заканчивается на /bonus
+	if len(path) < 7 || path[len(path)-6:] != "/bonus" {
+		http.Error(w, "not found", 404)
+		return
+	}
+	userID := path[7 : len(path)-6]
+
+	var points int64
+	err := db.QueryRow(r.Context(), "SELECT points FROM user_bonuses WHERE user_id = $1", userID).Scan(&points)
+	if err != nil {
+		// Если нет в базе, значит начислений не было, возвращаем 0
+		points = 0 
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int64{"points": points})
+}
+
+// --- Логика ворот (Gate) ---
+
 func waitGate() {
 	for {
 		gateMu.Lock()
@@ -281,7 +488,6 @@ func recordPaymentSuccess() {
 	gateOpenUntil = time.Time{}
 }
 
-// Закрываем ворота только при таймаутах (зависаниях), чтобы не застрять на ошибках 500
 func recordPaymentTimeout() {
 	gateMu.Lock()
 	defer gateMu.Unlock()
@@ -291,8 +497,6 @@ func recordPaymentTimeout() {
 		consecutiveFailures = 0
 	}
 }
-
-// --- Сетевые вызовы ---
 
 func reserveInventory(ctx context.Context, orderID string, items []byte) bool {
 	body := map[string]interface{}{"order_id": orderID, "items": json.RawMessage(items)}
@@ -310,7 +514,6 @@ func releaseInventory(ctx context.Context, orderID string) {
 }
 
 func chargePayment(ctx context.Context, orderID string, amount int64) (string, error) {
-	// Ждём, если Payment сейчас перегружен/висит
 	waitGate()
 
 	body := PaymentReq{OrderID: orderID, AmountCents: amount, Currency: "RUB"}
@@ -322,7 +525,6 @@ func chargePayment(ctx context.Context, orderID string, amount int64) (string, e
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		// Различаем таймаут сети (S4) и другие ошибки (например, потерю ответа S5)
 		var netErr net.Error
 		if errors.As(err, &netErr) && netErr.Timeout() {
 			recordPaymentTimeout()
@@ -332,7 +534,7 @@ func chargePayment(ctx context.Context, orderID string, amount int64) (string, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 402 {
-		recordPaymentSuccess() // Банк ответил штатно, хоть и отказом
+		recordPaymentSuccess()
 		return "declined", nil
 	}
 	if resp.StatusCode == 201 || resp.StatusCode == 200 {
@@ -340,6 +542,5 @@ func chargePayment(ctx context.Context, orderID string, amount int64) (string, e
 		return "captured", nil
 	}
 	
-	// Ошибка 500 (S2) — не трогаем ворота, просто вернем ошибку для ретрая
 	return "", fmt.Errorf("payment returned %d", resp.StatusCode)
 }
