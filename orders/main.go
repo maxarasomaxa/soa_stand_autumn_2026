@@ -1,7 +1,3 @@
-// Orders — наивная реализация.
-//
-// Оформление заказа: зарезервировать товар в Inventory, списать деньги в
-// Payment, записать заказ в базу. Пока Payment и Inventory работают без отказов, всё работает.
 package main
 
 import (
@@ -11,25 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
+	"log"
+	"net"
 	"net/http"
 	"os"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-const schema = `
-CREATE TABLE IF NOT EXISTS orders (
-    id           TEXT PRIMARY KEY,
-    user_id      TEXT NOT NULL,
-    status       TEXT NOT NULL,
-    amount_cents BIGINT NOT NULL,
-    items        JSONB NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-)`
 
 type Item struct {
 	SKU        string `json:"sku"`
@@ -37,230 +23,323 @@ type Item struct {
 	PriceCents int64  `json:"price_cents"`
 }
 
-type OrderRequest struct {
+type CreateOrderReq struct {
 	UserID string `json:"user_id"`
 	Items  []Item `json:"items"`
 }
 
-type app struct {
+type PaymentReq struct {
+	OrderID     string `json:"order_id"`
+	AmountCents int64  `json:"amount_cents"`
+	Currency    string `json:"currency"`
+}
+
+var (
 	db           *pgxpool.Pool
+	orderQueue   chan string
 	paymentURL   string
 	inventoryURL string
-}
+
+	// Состояние предохранителя (Gate) для Payment
+	gateMu              sync.Mutex
+	consecutiveFailures int
+	gateOpenUntil       time.Time
+
+	httpClient = &http.Client{Timeout: 5 * time.Second}
+)
 
 func main() {
-	a := &app{
-		paymentURL:   strings.TrimRight(mustEnv("PAYMENT_URL"), "/"),
-		inventoryURL: strings.TrimRight(mustEnv("INVENTORY_URL"), "/"),
+	port := getEnv("PORT", "8080")
+	dbURL := getEnv("DATABASE_URL", "postgres://orders:orders@postgres:5432/orders")
+	paymentURL = getEnv("PAYMENT_URL", "http://mocks:8080/payment")
+	inventoryURL = getEnv("INVENTORY_URL", "http://mocks:8080/inventory")
+
+	initDB(dbURL)
+	orderQueue = make(chan string, 1000)
+
+	// Запускаем 5 фоновых воркеров
+	for i := 0; i < 5; i++ {
+		go worker()
 	}
-	db, err := connect(mustEnv("DATABASE_URL"))
+
+	recoverPendingOrders()
+
+	http.HandleFunc("/healthz", healthz)
+	http.HandleFunc("/orders", createOrder)
+	http.HandleFunc("/orders/", getOrder)
+
+	log.Printf("Starting server on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
+func newUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+func initDB(url string) {
+	var err error
+	db, err = pgxpool.New(context.Background(), url)
 	if err != nil {
-		slog.Error("база", "err", err)
-		os.Exit(1)
+		log.Fatalf("Unable to connect to database: %v", err)
 	}
-	a.db = db
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	mux.HandleFunc("POST /orders", a.createOrder)
-	mux.HandleFunc("GET /orders/{id}", a.getOrder)
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	slog.Info("orders: слушаю", "port", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
-		slog.Error("server", "err", err)
-		os.Exit(1)
+	schema := `
+	CREATE TABLE IF NOT EXISTS orders (
+		id UUID PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		items JSONB NOT NULL,
+		amount_cents BIGINT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'pending',
+		reservation_done BOOLEAN NOT NULL DEFAULT FALSE,
+		payment_state TEXT NOT NULL DEFAULT 'none',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);`
+	_, err = db.Exec(context.Background(), schema)
+	if err != nil {
+		log.Fatalf("Failed to create schema: %v", err)
 	}
 }
 
-// connect ждёт базу: она может подниматься дольше сервиса.
-func connect(url string) (*pgxpool.Pool, error) {
-	var lastErr error
-	for range 60 {
-		db, err := pgxpool.New(context.Background(), url)
-		if err == nil {
-			if _, err = db.Exec(context.Background(), schema); err == nil {
-				return db, nil
-			}
-			db.Close()
-		}
-		lastErr = err
-		slog.Info("база недоступна, жду", "err", err)
-		time.Sleep(time.Second)
-	}
-	return nil, lastErr
-}
-
-func (a *app) createOrder(w http.ResponseWriter, r *http.Request) {
-	var req OrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !valid(req) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request"})
+func healthz(w http.ResponseWriter, r *http.Request) {
+	if err := db.Ping(r.Context()); err != nil {
+		http.Error(w, "db not ready", 503)
 		return
 	}
-	id := newID()
+	w.WriteHeader(200)
+}
+
+func createOrder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	var req CreateOrderReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	if len(req.Items) == 0 {
+		http.Error(w, "items required", 400)
+		return
+	}
+
 	var amount int64
 	for _, it := range req.Items {
+		if it.Qty <= 0 || it.PriceCents < 0 {
+			http.Error(w, "invalid item", 400)
+			return
+		}
 		amount += int64(it.Qty) * it.PriceCents
 	}
 
-	if err := a.reserve(id, req.Items); err != nil {
-		a.fail(w, id, err)
+	id := newUUID()
+	itemsJSON, _ := json.Marshal(req.Items)
+
+	_, err := db.Exec(r.Context(),
+		"INSERT INTO orders (id, user_id, items, amount_cents) VALUES ($1, $2, $3, $4)",
+		id, req.UserID, itemsJSON, amount)
+	if err != nil {
+		log.Printf("db insert error: %v", err)
+		http.Error(w, "db error", 500)
 		return
 	}
-	declined, err := a.charge(id, amount)
-	if err != nil {
-		a.fail(w, id, err)
+
+	select {
+	case orderQueue <- id:
+	default:
+		log.Printf("queue full, order %s left in db", id)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "pending"})
+}
+
+func getOrder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
 		return
 	}
-	status := "paid"
-	if declined {
-		a.release(id)
-		status = "rejected"
-	}
 
-	items, _ := json.Marshal(req.Items)
-	_, err = a.db.Exec(context.Background(),
-		`INSERT INTO orders (id, user_id, status, amount_cents, items) VALUES ($1, $2, $3, $4, $5)`,
-		id, req.UserID, status, amount, items)
+	id := r.URL.Path[len("/orders/"):]
+	var status string
+	var amount int64
+	err := db.QueryRow(r.Context(), "SELECT status, amount_cents FROM orders WHERE id = $1", id).Scan(&status, &amount)
 	if err != nil {
-		a.fail(w, id, err)
+		http.Error(w, "not found", 404)
 		return
 	}
-	slog.Info("order", "id", id, "status", status)
-	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "status": status})
-}
 
-func (a *app) fail(w http.ResponseWriter, id string, err error) {
-	slog.Error("POST /orders", "id", id, "err", err)
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal", "message": err.Error()})
-}
-
-func (a *app) getOrder(w http.ResponseWriter, r *http.Request) {
-	var (
-		id, status string
-		amount     int64
-	)
-	err := a.db.QueryRow(r.Context(), `SELECT id, status, amount_cents FROM orders WHERE id = $1`,
-		r.PathValue("id")).Scan(&id, &status, &amount)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": status, "amount_cents": amount})
-}
-
-func (a *app) reserve(id string, items []Item) error {
-	type resvItem struct {
-		SKU string `json:"sku"`
-		Qty int    `json:"qty"`
-	}
-	ri := make([]resvItem, 0, len(items))
-	for _, it := range items {
-		ri = append(ri, resvItem{it.SKU, it.Qty})
-	}
-	code, err := call(http.MethodPost, a.inventoryURL+"/reservations", map[string]any{"order_id": id, "items": ri})
-	if err != nil {
-		return err
-	}
-	if code != http.StatusOK && code != http.StatusCreated {
-		return fmt.Errorf("inventory: %d", code)
-	}
-	return nil
-}
-
-func (a *app) release(id string) {
-	_, _ = call(http.MethodDelete, a.inventoryURL+"/reservations/"+id, nil)
-}
-
-var errPayment = errors.New("payment")
-
-// charge списывает деньги; declined — банк отказал.
-func (a *app) charge(id string, amount int64) (declined bool, err error) {
-	declined, err = a.chargeOnce(id, amount)
-	if err != nil {
-		slog.Warn("оплата не прошла, пробую ещё раз", "id", id, "err", err)
-		declined, err = a.chargeOnce(id, amount)
-	}
-	return declined, err
-}
-
-func (a *app) chargeOnce(id string, amount int64) (bool, error) {
-	code, err := call(http.MethodPost, a.paymentURL+"/payments", map[string]any{
-		"order_id":     id,
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":           id,
+		"status":       status,
 		"amount_cents": amount,
-		"currency":     "RUB",
 	})
-	if err != nil {
-		return false, err
-	}
-	switch code {
-	case http.StatusOK, http.StatusCreated:
-		return false, nil
-	case http.StatusPaymentRequired:
-		return true, nil
-	}
-	return false, fmt.Errorf("%w: %d", errPayment, code)
 }
 
-func call(method, url string, body any) (int, error) {
-	var rd io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return 0, err
+func worker() {
+	for id := range orderQueue {
+		processOrder(id)
+	}
+}
+
+func processOrder(id string) {
+	ctx := context.Background()
+
+	var userID, status, paymentState string
+	var itemsJSON []byte
+	var amount int64
+	var reservationDone bool
+	err := db.QueryRow(ctx, "SELECT user_id, items, amount_cents, status, reservation_done, payment_state FROM orders WHERE id = $1", id).
+		Scan(&userID, &itemsJSON, &amount, &status, &reservationDone, &paymentState)
+	
+	if err != nil || status != "pending" {
+		return
+	}
+
+	// 1. Резерв на складе
+	if !reservationDone {
+		if !reserveInventory(ctx, id, itemsJSON) {
+			requeue(id, 2*time.Second)
+			return
 		}
-		rd = bytes.NewReader(b)
+		db.Exec(ctx, "UPDATE orders SET reservation_done = true WHERE id = $1", id)
 	}
-	req, err := http.NewRequest(method, url, rd)
+
+	// 2. Оплата (с ожиданием Ворот внутри)
+	payStatus, err := chargePayment(ctx, id, amount)
 	if err != nil {
-		return 0, err
+		db.Exec(ctx, "UPDATE orders SET payment_state = 'unknown' WHERE id = $1", id)
+		requeue(id, 2*time.Second) // Быстрый ретрай
+		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, err
+
+	// 3. Установка финального статуса
+	if payStatus == "captured" {
+		db.Exec(ctx, "UPDATE orders SET status = 'paid', payment_state = 'charged' WHERE id = $1", id)
+	} else if payStatus == "declined" {
+		releaseInventory(ctx, id)
+		db.Exec(ctx, "UPDATE orders SET status = 'rejected', payment_state = 'declined' WHERE id = $1", id)
 	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode, nil
 }
 
-func valid(r OrderRequest) bool {
-	if r.UserID == "" || len(r.Items) == 0 {
+func requeue(id string, delay time.Duration) {
+	time.AfterFunc(delay, func() {
+		select {
+		case orderQueue <- id:
+		default:
+		}
+	})
+}
+
+func recoverPendingOrders() {
+	rows, err := db.Query(context.Background(), "SELECT id FROM orders WHERE status = 'pending'")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			orderQueue <- id
+		}
+	}
+}
+
+// --- Логика предохранителя (Gate) ---
+
+// Блокирует воркер, если Payment сейчас "лежит" (S4)
+func waitGate() {
+	for {
+		gateMu.Lock()
+		if time.Now().After(gateOpenUntil) {
+			gateMu.Unlock()
+			return
+		}
+		waitTime := time.Until(gateOpenUntil)
+		gateMu.Unlock()
+		time.Sleep(waitTime)
+	}
+}
+
+func recordPaymentSuccess() {
+	gateMu.Lock()
+	defer gateMu.Unlock()
+	consecutiveFailures = 0
+	gateOpenUntil = time.Time{}
+}
+
+// Закрываем ворота только при таймаутах (зависаниях), чтобы не застрять на ошибках 500
+func recordPaymentTimeout() {
+	gateMu.Lock()
+	defer gateMu.Unlock()
+	consecutiveFailures++
+	if consecutiveFailures >= 3 {
+		gateOpenUntil = time.Now().Add(10 * time.Second)
+		consecutiveFailures = 0
+	}
+}
+
+// --- Сетевые вызовы ---
+
+func reserveInventory(ctx context.Context, orderID string, items []byte) bool {
+	body := map[string]interface{}{"order_id": orderID, "items": json.RawMessage(items)}
+	b, _ := json.Marshal(body)
+	resp, err := httpClient.Post(inventoryURL+"/reservations", "application/json", bytes.NewReader(b))
+	if err != nil || resp.StatusCode >= 500 {
 		return false
-	}
-	for _, it := range r.Items {
-		if it.SKU == "" || it.Qty < 1 || it.PriceCents < 0 {
-			return false
-		}
 	}
 	return true
 }
 
-func newID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+func releaseInventory(ctx context.Context, orderID string) {
+	req, _ := http.NewRequest(http.MethodDelete, inventoryURL+"/reservations/"+orderID, nil)
+	httpClient.Do(req)
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
-}
+func chargePayment(ctx context.Context, orderID string, amount int64) (string, error) {
+	// Ждём, если Payment сейчас перегружен/висит
+	waitGate()
 
-func mustEnv(k string) string {
-	v := os.Getenv(k)
-	if v == "" {
-		slog.Error("не задана переменная окружения", "name", k)
-		os.Exit(1)
+	body := PaymentReq{OrderID: orderID, AmountCents: amount, Currency: "RUB"}
+	b, _ := json.Marshal(body)
+
+	req, _ := http.NewRequest(http.MethodPost, paymentURL+"/payments", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", orderID)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		// Различаем таймаут сети (S4) и другие ошибки (например, потерю ответа S5)
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			recordPaymentTimeout()
+		}
+		return "", err
 	}
-	return v
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 402 {
+		recordPaymentSuccess() // Банк ответил штатно, хоть и отказом
+		return "declined", nil
+	}
+	if resp.StatusCode == 201 || resp.StatusCode == 200 {
+		recordPaymentSuccess()
+		return "captured", nil
+	}
+	
+	// Ошибка 500 (S2) — не трогаем ворота, просто вернем ошибку для ретрая
+	return "", fmt.Errorf("payment returned %d", resp.StatusCode)
 }

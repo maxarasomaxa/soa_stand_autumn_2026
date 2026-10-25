@@ -5,7 +5,7 @@ RUN go mod download
 COPY *.go ./
 RUN CGO_ENABLED=0 go build -trimpath -o /out/orders .
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.19
 COPY --from=build /out/orders /orders
 EXPOSE 8080
 ENTRYPOINT ["/orders"]
